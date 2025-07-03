@@ -1,72 +1,151 @@
 #############################
 #
-# Set-NewQuota.ps1
+# Set-MailboxQuotasForGroupMembers.ps1
 # Resets Users to default Quota if they are
 # not Member of a Custom Quota Group
 #
 # Sets Quota of Groupmembers to predefined Values
 #
-#############################
-# Domaincontroller, Group and Limit Declaration
-#############################
-# (<groupname>,<Warning>,<sendlimit>,<receivelimit>)
 
-$Domaincontroller="dc03.noehw.local"
-$domain = "noehw\"
-$LogFileAge = 14
+#Requires -Version 3.0
+#Requires -Module ActiveDirectory
 
-$mygroupandlimits = @(
-             ("MBX2016_Quota_1GB","750MB","1024MB","1250MB"),
-             ("MBX2016_Quota_4GB","3584MB","4096MB","4403MB"),
-             ("MBX2016_Quota_8GB","7168MB","8192MB","8806MB"),
-             ("MBX2016_Quota_16GB","14336MB","16384MB","17612MB")
-   )
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory=$false)]
+    [System.IO.FileInfo]
+    $ConfigFile = (Join-Path -Path $PSScriptRoot -ChildPath "Set-MailboxQuotaForGroupMembers_Config.json")
+)
 
+$Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
 
-##############################
-# Script starts here
-##############################
+$Domaincontroller=$Config.Domaincontroller
+$domain = $Config.domain
+#$LogFileAge = $Config.LogFileAge
+$Filter = $config.Filter -join ' -and '
+$Quotas = $Config.Quotas
 
-# 1.0 Check Powershell Version
-if ((Get-Host).Version.Major -eq 1)
+[string]$LogfileFullPath = Join-Path -Path $PSScriptRoot (Join-Path $MyInvocation.MyCommand.Name ($MyInvocation.MyCommand.Name + "_" + $($ContactSourceMailbox.Split("@")[0]) + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now))
+$script:NoLogging = $Config.NoLogging
+function Write-LogFile
 {
-	throw "Powershell Version 1 not supported";
-}
+    # Logging function, used for progress and error logging...
+    # Uses the globally (script scoped) configured variables 'LogfileFullPath' to identify the logfile and 'NoLogging' to disable it.
+    #
+    [CmdLetBinding()]
 
-# Check AD Module, attempt to load
-if (!(Get-Command Get-ADGroupMember -ErrorAction SilentlyContinue))
-{
-    Import-Module ActiveDirectory
-    if(!(Get-Module ActiveDirectory))
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [Parameter(Mandatory = $false)]
+        [string]$LogPrefix,
+        [System.Management.Automation.ErrorRecord]$ErrorInfo = $null
+    )
+
+    # Prefix the string to write with the current Date and Time, add error message if present...
+    if ($ErrorInfo)
     {
-        throw "Active Directory Module cannot be loaded"
+        $logLine = "{0:d.M.y H:mm:ss} : ERROR {1}: {2} Error: {3}" -f [DateTime]::Now, $LogPrefix, $Message, $ErrorInfo.Exception.Message
+    }
+
+    else
+    {
+        $logLine = "{0:d.M.y H:mm:ss} : INFO {1}: {2}" -f [DateTime]::Now, $LogPrefix, $Message
+    }
+
+    if (-not $NoLogging)
+    {
+        # Create the Script:Logfile and folder structure if it doesn't exist
+        if (-not (Test-Path $LogfileFullPath -PathType Leaf))
+        {
+            New-Item -ItemType File -Path $LogfileFullPath -Force -Confirm:$false -WhatIf:$false | Out-Null
+            Add-Content -Value "Logging started." -Path $LogfileFullPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
+        }
+
+        # Write to the Script:Logfile
+        Add-Content -Value $logLine -Path $LogfileFullPath -Encoding UTF8 -WhatIf:$false -Confirm:$false
+        Write-Verbose $logLine
+    }
+    else
+    {
+        Write-Host $logLine
     }
 }
-    
-
-# Check Exchange Management Shell, attempt to load
-if (!(Get-Command Get-ExchangeServer -ErrorAction SilentlyContinue))
+Function LoadADModule
 {
-	
-	if (Test-Path "C:\Program Files\Microsoft\Exchange Server\V14\bin\RemoteExchange.ps1")
-	{
-		. 'C:\Program Files\Microsoft\Exchange Server\V14\bin\RemoteExchange.ps1'
-		Connect-ExchangeServer -auto
-	} elseif (Test-Path "C:\Program Files\Microsoft\Exchange Server\bin\Exchange.ps1") {
-		Add-PSSnapIn Microsoft.Exchange.Management.PowerShell.Admin
-		.'C:\Program Files\Microsoft\Exchange Server\bin\Exchange.ps1'
-	} elseif (Test-Path "C:\Program Files\Microsoft\Exchange Server\V15\bin\RemoteExchange.ps1") {
-		. 'C:\Program Files\Microsoft\Exchange Server\V15\bin\RemoteExchange.ps1'
-		Connect-ExchangeServer -auto
-	}else {
-		throw "Exchange Management Shell cannot be loaded"
-	}
+    $ModuleName = "ActiveDirectory"
+    $IsModuleInstalled = (Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1)
+    
+    if ($IsModuleInstalled.Name -eq "$($ModuleName)")
+    {   
+        try
+        {
+            Import-Module -Name $ModuleName -ErrorAction Stop -WarningAction SilentlyContinue -DisableNameChecking
+            Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module successfully loaded."
+        }
+        
+        catch
+        {
+            $Textbox_Messages.Text = "ActiveDirectory Module could not be loaded. Error: $($Error.Exception.InnerException)"
+            Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_}
+    }
+
+    else
+    {
+        Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module not installed. Please install first!"
+    }
+} 
+function ConnectExchange
+{
+    # Check if a connection to an exchange server exists and connect if necessary...
+    if (-NOT (Get-PSSession | Where-Object ConfigurationName -EQ "Microsoft.Exchange"))
+    {
+        $LogPrefix = "ConnectExchange"
+
+        # Test if Exchange Management Shell Module is installed - if not, exit the script
+        $EMSModuleFile = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup -ErrorAction SilentlyContinue).MsiInstallPath + "bin\RemoteExchange.ps1"
+        
+        # If the EMS Module wasn't found
+        if (-Not (Test-Path $EMSModuleFile))
+        {
+            # Write Error end exit the script
+            $ErrorMessage = "Exchange Management Shell Module not found on this computer. Please run this script on a computer with Exchange Management Tools installed!"
+            Write-LogFile -LogPrefix $LogPrefix -Message $ErrorMessage
+            Exit
+        }
+
+        else
+        {
+            # Load Exchange Management Shell
+            try
+            {
+                # Dot source the EMS Script
+                . $($EMSModuleFile) -ErrorAction Stop | Out-Null
+                Write-LogFile -LogPrefix $LogPrefix -Message "Successfully loaded Exchange Management Shell Module."
+            }
+
+            catch
+            {
+                Write-LogFile -LogPrefix $LogPrefix -Message "Unable to load Exchange Management Shell Module." -ErrorInfo $_
+                Exit
+            }
+
+            # Connect to Exchange Server
+            try
+            {
+                Connect-ExchangeServer -auto -ClientApplication:ManagementShell -ErrorAction Stop | Out-Null
+                Write-LogFile -LogPrefix $LogPrefix -Message "Successfully connected to Exchange Server."
+            }
+
+            catch
+            {
+                Write-LogFile -LogPrefix $LogPrefix -Message "Unable to connect to Exchange Server." -ErrorInfo $_
+                Exit
+            }
+        }
+    }
 }
-
-#Push-Location (Split-Path $script:MyInvocation.MyCommand.Path)
-
-
-. C:\Scripts\MailboxQuota\Function-Write-Log.ps1
 
 #############################
 # Custom Object Decleration
@@ -89,34 +168,6 @@ foreach($line in $mygroupandlimits)
     $GroupLimits += ($newline | select *)
 }
 
-#write-host $GroupLimits
-
-######################
-# Routines
-######################
-# remove users only
-######################
-
-$logfile = ".\Log\LOG_"+(Get-Date -Format ddMMyyyyHHmm)+".txt"
-#
-#Write-Log -Message "**********************************************************************************" -Path $logfile
-#Write-Log -Message "Remove Users without Mailbox from Groups...." -Path $logfile
-#
-#foreach($group in $GroupLimits)
-#{
-#    $quotagroup2members = $quotagroup2members = Get-ADGroupMember $group.group -Server $Domaincontroller| Get-aduser -Properties msExchRecipientTypeDetails
-#    $group2membersfiltered = ($quotagroup2members | ?{$_.msExchRecipientTypeDetails -eq $null})
-#    #$group2membersfiltered | ?{$_.recipienttype -ne "usermailbox"}
-#
-#    foreach($gmf in $group2membersfiltered)
-#    {
-#	    Remove-ADGroupMember -Identity $group.group -Member $gmf.SamAccountName -Server $Domaincontroller -Confirm:$false
-#        $message = "Removing distribution group member " + $gmf.SamAccountName + " from distribution group " + $group.group + "."
-#        Write-Log -Message $message -Path $logfile
-#    }
-#
-#}
-
 ######################
 # Get Quotagroupmembers
 ######################
@@ -130,15 +181,7 @@ foreach($group in $GroupLimits)
     }
 }
 
-$Filter = @(
-    '(RecipientType -eq "UserMailbox")'
-    '(Displayname -notlike "Discovery Search Mailbox*")'
-    '(Displayname -ne "Personal 1")'
-    '(Displayname -ne "Personal 2")'
-    '(Displayname -ne "Goll Gabriela")'
-    '(Displayname -ne "Gleiß Regina")'
-    '(UseDatabaseQuotaDefaults -eq $false)'
-) -join ' -and '
+
 
 $MBXQuota = Get-Mailbox -resultsize unlimited -DomainController $Domaincontroller -filter $Filter
 
