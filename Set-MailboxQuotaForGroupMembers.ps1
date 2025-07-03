@@ -19,11 +19,11 @@ param (
 
 $Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
 
-$Domaincontroller=$Config.Domaincontroller
+$Domaincontroller = $Config.Domaincontroller
 $domain = $Config.domain
-#$LogFileAge = $Config.LogFileAge
 $Filter = $config.Filter -join ' -and '
 $Quotas = $Config.Quotas
+#$LogFileAge = $Config.LogFileAge
 
 [string]$LogfileFullPath = Join-Path -Path $PSScriptRoot (Join-Path $MyInvocation.MyCommand.Name ($MyInvocation.MyCommand.Name + "_" + $($ContactSourceMailbox.Split("@")[0]) + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now))
 $script:NoLogging = $Config.NoLogging
@@ -172,21 +172,18 @@ foreach($line in $mygroupandlimits)
 # Get Quotagroupmembers
 ######################
 
-$MBXGroup = @()
+#$MBXGroup = @()
 
-foreach($group in $GroupLimits)
+foreach($entry in $Quotas)
 {
-    foreach($Sam in ((Get-ADGroupMember $group.Group -Server $Domaincontroller).SamAccountName)){
-    $MBXGroup += get-mailbox $domain$sam -DomainController $Domaincontroller #-ErrorAction silentlycontinue
+    $MBXGroup = foreach ($Member in ((Get-ADGroupMember $entry.Name -Server $Domaincontroller).SamAccountName))
+    {
+        get-mailbox $Member -DomainController $Domaincontroller -ErrorAction SilentlyContinue
     }
 }
 
-
-
-$MBXQuota = Get-Mailbox -resultsize unlimited -DomainController $Domaincontroller -filter $Filter
-
+$MBXQuota = Get-Mailbox -Resultsize unlimited -DomainController $Domaincontroller -Filter $Filter
 $MBXComp = (Compare-Object -ReferenceObject $MBXGroup.samaccountname -DifferenceObject $MBXQuota.samaccountname | ? {$_.SideIndicator -eq "=>"})
-
 
 ######################
 # User is not Member of a Custom Quota Group -> Reset to Database Default !
