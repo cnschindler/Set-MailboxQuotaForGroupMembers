@@ -1,12 +1,29 @@
-#############################
+########################################################################
 #
 # Set-MailboxQuotasForGroupMembers.ps1
-# Resets Users to default Quota if they are
-# not Member of a Custom Quota Group
 #
-# Sets Quota of Groupmembers to predefined Values
+# Sets Mailbox-Storage-Quotas of members of a group to predefined Values
 #
+# This script sets mailbox quotas for members of specified Active Directory groups based on a JSON configuration file.
+# The JSON configuration file defines the groups and their corresponding mailbox quota settings such as IssueWarningQuota,
+# ProhibitSendQuota, and ProhibitSendReceiveQuota.
+#
+# The script retrieves group members, checks if they have mailboxes, and applies the specified quota settings to each mailbox.
+# It also includes logging functionality to track the progress and any errors encountered during execution.
+# 
+# Requirements: Active Directory PowerShell Module and Exchange Management Shell
+#
+# Version: 1.0
+# Author: Christian Schindler, NTx BackOffice Consulting Group GmbH
+# Contact: christian.schindler@ntx.at
+# Date: 2025-07-07
+# This script is provided as-is without any warranties. Use at your own risk.
+# License: GNU General Public License v3.0 (GPL-3.0)
+#
+########################################################################
 
+# Check if the script is running in PowerShell version 3.0 or higher and if the ActiveDirectory module is available
+# Requires statement ensures that the script will not run if the required version or module is not present
 #Requires -Version 3.0
 #Requires -Module ActiveDirectory
 
@@ -17,41 +34,33 @@ param (
     $ConfigFile = (Join-Path -Path $PSScriptRoot -ChildPath "Set-MailboxQuotaForGroupMembers_Config.json")
 )
 
-$Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
+# Global variables
+# Define the path for the logfile, using the script name and current date/time for uniqueness
+[System.IO.FileInfo]$LogfileFullPath = Join-Path -Path $PSScriptRoot (Join-Path $MyInvocation.MyCommand.Name ($MyInvocation.MyCommand.Name + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now))
+$script:NoLogging
 
-$Domaincontroller = $Config.Domaincontroller
-$domain = $Config.domain
-$Filter = $config.Filter -join ' -and '
-$Quotas = $Config.Quotas
-#$LogFileAge = $Config.LogFileAge
-
-[string]$LogfileFullPath = Join-Path -Path $PSScriptRoot (Join-Path $MyInvocation.MyCommand.Name ($MyInvocation.MyCommand.Name + "_" + $($ContactSourceMailbox.Split("@")[0]) + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now))
-$script:NoLogging = $Config.NoLogging
+# Logging function, used for progress and error logging...
+# Uses the globally (script scoped) configured variables 'LogfileFullPath' to identify the logfile and 'NoLogging' to disable it.
 function Write-LogFile
 {
-    # Logging function, used for progress and error logging...
-    # Uses the globally (script scoped) configured variables 'LogfileFullPath' to identify the logfile and 'NoLogging' to disable it.
-    #
     [CmdLetBinding()]
 
     param
     (
         [Parameter(Mandatory = $true)]
         [string]$Message,
-        [Parameter(Mandatory = $false)]
-        [string]$LogPrefix,
         [System.Management.Automation.ErrorRecord]$ErrorInfo = $null
     )
 
     # Prefix the string to write with the current Date and Time, add error message if present...
     if ($ErrorInfo)
     {
-        $logLine = "{0:d.M.y H:mm:ss} : ERROR {1}: {2} Error: {3}" -f [DateTime]::Now, $LogPrefix, $Message, $ErrorInfo.Exception.Message
+        $logLine = "{0:d.M.y H:mm:ss} : ERROR: {1} Error: {2}" -f [DateTime]::Now, $Message, $ErrorInfo.Exception.Message
     }
 
     else
     {
-        $logLine = "{0:d.M.y H:mm:ss} : INFO {1}: {2}" -f [DateTime]::Now, $LogPrefix, $Message
+        $logLine = "{0:d.M.y H:mm:ss} : INFO: {1}" -f [DateTime]::Now, $Message
     }
 
     if (-not $NoLogging)
@@ -72,7 +81,24 @@ function Write-LogFile
         Write-Host $logLine
     }
 }
-Function LoadADModule
+function Import-ConfigFile
+{
+    # Check if the configuration file exists
+    if (-not (Test-Path -Path $ConfigFile -PathType Leaf))
+    {
+        Write-LogFile -Message "Configuration file not found: $ConfigFile"
+        Exit
+    }
+
+    # Load the configuration file
+    Write-LogFile -Message "Loading configuration file: $ConfigFile"
+    $Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
+
+    [string]$Script:Domaincontroller = $Config.Domaincontroller
+    $Script:Quotas = $Config.Quotas
+    $Script:LogFileAge = $Config.LogFileAge
+}
+Function Import-ADModule
 {
     $ModuleName = "ActiveDirectory"
     $IsModuleInstalled = (Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1)
@@ -82,27 +108,25 @@ Function LoadADModule
         try
         {
             Import-Module -Name $ModuleName -ErrorAction Stop -WarningAction SilentlyContinue -DisableNameChecking
-            Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module successfully loaded."
+            Write-LogFile -Message "ActiveDirectory Module successfully loaded."
         }
         
         catch
         {
             $Textbox_Messages.Text = "ActiveDirectory Module could not be loaded. Error: $($Error.Exception.InnerException)"
-            Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_}
+            Write-LogFile -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_}
     }
 
     else
     {
-        Write-LogFile -LogPrefix "LoadADModule" -Message "ActiveDirectory Module not installed. Please install first!"
+        Write-LogFile -Message "ActiveDirectory Module not installed. Please install first!"
     }
 } 
-function ConnectExchange
+function Connect-ExchangeOnPremieses
 {
     # Check if a connection to an exchange server exists and connect if necessary...
     if (-NOT (Get-PSSession | Where-Object ConfigurationName -EQ "Microsoft.Exchange"))
     {
-        $LogPrefix = "ConnectExchange"
-
         # Test if Exchange Management Shell Module is installed - if not, exit the script
         $EMSModuleFile = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup -ErrorAction SilentlyContinue).MsiInstallPath + "bin\RemoteExchange.ps1"
         
@@ -111,7 +135,7 @@ function ConnectExchange
         {
             # Write Error end exit the script
             $ErrorMessage = "Exchange Management Shell Module not found on this computer. Please run this script on a computer with Exchange Management Tools installed!"
-            Write-LogFile -LogPrefix $LogPrefix -Message $ErrorMessage
+            Write-LogFile -Message $ErrorMessage
             Exit
         }
 
@@ -122,12 +146,12 @@ function ConnectExchange
             {
                 # Dot source the EMS Script
                 . $($EMSModuleFile) -ErrorAction Stop | Out-Null
-                Write-LogFile -LogPrefix $LogPrefix -Message "Successfully loaded Exchange Management Shell Module."
+                Write-LogFile -Message "Successfully loaded Exchange Management Shell Module."
             }
 
             catch
             {
-                Write-LogFile -LogPrefix $LogPrefix -Message "Unable to load Exchange Management Shell Module." -ErrorInfo $_
+                Write-LogFile -Message "Unable to load Exchange Management Shell Module." -ErrorInfo $_
                 Exit
             }
 
@@ -135,127 +159,107 @@ function ConnectExchange
             try
             {
                 Connect-ExchangeServer -auto -ClientApplication:ManagementShell -ErrorAction Stop | Out-Null
-                Write-LogFile -LogPrefix $LogPrefix -Message "Successfully connected to Exchange Server."
+                Write-LogFile -Message "Successfully connected to Exchange Server."
             }
 
             catch
             {
-                Write-LogFile -LogPrefix $LogPrefix -Message "Unable to connect to Exchange Server." -ErrorInfo $_
+                Write-LogFile -Message "Unable to connect to Exchange Server." -ErrorInfo $_
                 Exit
             }
         }
     }
 }
 
-#############################
-# Custom Object Decleration
-#############################
+# Load Active Directory Module
+Import-ADModule
 
-$GroupLimits = @()
-$newline = New-Object –TypeName PSCustomObject
-Add-Member -InputObject $newline -MemberType NoteProperty -Name Group -Value ""
-Add-Member -InputObject $newline -MemberType NoteProperty -Name Warning -Value ""
-Add-Member -InputObject $newline -MemberType NoteProperty -Name Send -Value ""
-Add-Member -InputObject $newline -MemberType NoteProperty -Name Receive -Value ""
+# Connect to Exchange Server
+Connect-ExchangeOnPremieses
 
-foreach($line in $mygroupandlimits)
+# Import the configuration file
+Import-ConfigFile
+
+# Start setting mailbox quotas for group members
+Write-LogFile -Message "Starting to set mailbox quotas for group members."
+
+# Check if a Domaincontroller was specified in the configuration file, otherwise use the PrimaryDC
+if ([System.String]::IsNullOrEmpty($Domaincontroller))
 {
-    $newline.Group = $line[0]
-    $newline.Warning = $line[1]
-    $newline.Send = $line[2]
-    $newline.Receive = $line[3]
-
-    $GroupLimits += ($newline | select *)
+    $Domaincontroller = (Get-ADDomainController -Discover -Service "PrimaryDC").HostName
+    Write-LogFile -Message "No Domaincontroller specified, using PrimaryDC: $Domaincontroller"
 }
 
-######################
-# Get Quotagroupmembers
-######################
+else
+{
+    Write-LogFile -Message "Using Domaincontroller specified in config file: $Domaincontroller"
+}
 
-#$MBXGroup = @()
-
+# Iterate through each quota entry defined in the configuration file
 foreach($entry in $Quotas)
 {
-    $MBXGroup = foreach ($Member in ((Get-ADGroupMember $entry.Name -Server $Domaincontroller).SamAccountName))
+    Write-LogFile -Message "Processing group: $($entry.Name) with settings: IssueWarning=$($entry.Settings.IssueWarning), ProhibitSend=$($entry.Settings.ProhibitSend), ProhibitSendReceive=$($entry.Settings.ProhibitSendReceive)"
+
+    # Get all group members and their mailbox properties
+    # Using Get-ADGroupMember to retrieve group members and then filtering for mailboxes
+    $Groupmember = foreach ($Member in ((Get-ADGroupMember $entry.Name -Server $Domaincontroller).SamAccountName))
     {
         get-mailbox $Member -DomainController $Domaincontroller -ErrorAction SilentlyContinue
     }
-}
 
-$MBXQuota = Get-Mailbox -Resultsize unlimited -DomainController $Domaincontroller -Filter $Filter
-$MBXComp = (Compare-Object -ReferenceObject $MBXGroup.samaccountname -DifferenceObject $MBXQuota.samaccountname | ? {$_.SideIndicator -eq "=>"})
-
-######################
-# User is not Member of a Custom Quota Group -> Reset to Database Default !
-######################
-foreach($mbx in $MBXComp)
-{
-#    Set-Mailbox -DomainController $Domaincontroller -IssueWarningQuota unlimited -ProhibitSendQuota unlimited -ProhibitSendReceiveQuota unlimited -UseDatabaseQuotaDefaults $true -Identity $domain$($mbx.InputObject)
-#    Set-Mailbox -DomainController $Domaincontroller -UseDatabaseQuotaDefaults $true -Identity $domain$($mbx.InputObject)
-    $message = "Set DatabaseDefaultLimits to User " + $mbx.InputObject + "."
-    Write-Log -Message $message -Path $logfile
-}
-
-
-
-
-## Set Quota
-## 
-######################
-# Set Custom Quota for every Member of the Groups
-######################
-
-foreach($group in $GroupLimits)
-{
-    
-    $changefile = ".\" + $group.Group + ".csv"
-
-	if(Test-Path $changefile)
-	{
-		$changelist = Import-Csv -Delimiter "|" -Encoding Unicode -Path $changefile
-	}else
+    # If group members were found, set their mailbox quotas
+    if ($Groupmember.count -gt 0)
     {
-        $changelist = New-Object –TypeName PSCustomObject
-        Add-Member -InputObject $changelist -MemberType NoteProperty -Name SamAccountName -Value "nomembers_in_AD_Group_for_custom_quota"
-    }
-    
-    $MBX2Change = @()
-
-    foreach($sam in ((Get-ADGroupMember $group.Group -Server $Domaincontroller).SamAccountName))
-    {
-        $MBX2change +=  get-mailbox $domain$sam -DomainController $Domaincontroller -ErrorAction silentlycontinue
-    }
-
-    if($MBX2change.SamAccountName -eq $null)
-    {            
-        $MBX2change = New-Object –TypeName PSCustomObject
-        Add-Member -InputObject $MBX2change -MemberType NoteProperty -Name SamAccountName -Value "nomembers_in_AD_Group_for_custom_quota"
-    }
-
-
-    $changeitems = (Compare-Object -ReferenceObject $changelist.samaccountname -DifferenceObject $MBX2change.samaccountname | ?{$_.SideIndicator -eq "=>"})
-
-    if($changeitems -ne $null)
-    {
-        foreach($changeitem in $changeitems)
+        Write-LogFile -Message "Found $($Groupmember.count) members in group '$($entry.Name)'. Setting mailbox quotas..."
+        
+        # Iterate through each member of the group
+        foreach ($member in $Groupmember)
         {
-            Set-Mailbox -DomainController $Domaincontroller -IssueWarningQuota $group.Warning -ProhibitSendQuota $group.Send -ProhibitSendReceiveQuota $group.Receive -UseDatabaseQuotaDefaults $false -Identity $domain$($changeitem.InputObject)
-            $message = "Set CustomLimits to User " + $changeitem.InputObject + " from group " + $group.group + "."
-            Write-Log -Message $message -Path $logfile
+            try
+            {
+                # Set mailbox quotas for the current member
+                Write-LogFile -Message "Trying to set custom Quota for $($member.SamAccountName)"
+                Set-Mailbox -Identity $member.SamAccountName -IssueWarningQuota $entry.Settings.IssueWarning -ProhibitSendQuota $entry.Settings.ProhibitSend -ProhibitSendReceiveQuota $entry.Settings.ProhibitSendReceive -UseDatabaseQuotaDefaults $false -DomainController $Domaincontroller -ErrorAction Stop
+                Write-LogFile -Message "Successfully set Custom Quota for $($member.SamAccountName) to $($entry.Settings.IssueWarning), $($entry.Settings.ProhibitSend), $($entry.Settings.ProhibitSendReceive)."
+            }
+
+            catch
+            {
+                Write-LogFile -Message "Error setting Custom Quota for $($member.SamAccountName):" -ErrorInfo $_
+            }
         }
     }
 
-    $mbx2change | select samaccountname | export-Csv -Delimiter "|" -Encoding Unicode -Path $changefile
-
+    else
+    {
+        # If no members were found in the group, log a message and continue to the next group
+        Write-LogFile -Message "No members found in group '$($entry.Name)'. Skipping."
+        Continue
+    }
 }
 
-$logfiles = Get-ChildItem -Path . -Filter "log*.txt" | ? {$_.creationtime -lt ((Get-Date).adddays(-$LogFileAge))}
+Write-LogFile -Message "Finished setting mailbox quotas for group members."
 
+# Clean up old logfiles based on the configured age
+# Retrieve logfiles older than the configured age
+$logfiles = Get-ChildItem -Path $LogfileFullPath.Directory -Filter "*.log" | Where-Object {$_.creationtime -lt ((Get-Date).adddays(-$LogFileAge))}
+
+# Remove old logfiles
 foreach($file in $logfiles)
 {
-	Remove-Item $file.FullName -force
+    try
+    {
+        # Remove the logfile
+        Remove-Item $file.FullName -force -ErrorAction Stop -Confirm:$false -WhatIf:$false
+        Write-LogFile -Message "Successfully removed logfile: $($file.FullName)"
+    }
+
+    catch
+    {
+        # If an error occurs while removing the logfile, log the error
+        Write-LogFile -Message "Error removing logfile: $($file.FullName)" -ErrorInfo $_
+    }
 }
 
-Write-Log -Message "script ends here......." -Path $logfile
-
-
+# End of script
+Write-LogFile -Message "Script execution completed."
