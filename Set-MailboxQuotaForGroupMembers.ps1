@@ -106,7 +106,6 @@ Function Import-ADModule
     
     catch
     {
-        $Textbox_Messages.Text = "ActiveDirectory Module could not be loaded. Error: $($Error.Exception.InnerException)"
         Write-LogFile -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_
     }
 }
@@ -225,21 +224,33 @@ foreach($entry in $Quotas)
     if ($Groupmember.count -gt 0)
     {
         Write-LogFile -Message "Found $($Groupmember.count) members in group '$($entry.Name)'. Setting mailbox quotas..."
+        Write-LogFile -Message "If quota settings are already set to the values specified in the config file, the mailbox will be skipped."
         
         # Iterate through each member of the group
         foreach ($member in $Groupmember)
         {
-            try
+            if($Entry.Settings.IssueWarning.Replace("MB","") -eq $Member.IssueWarningQuota.value.ToMB() -and
+               $Entry.Settings.ProhibitSend.Replace("MB","") -eq $Member.ProhibitSendQuota.value.ToMB() -and
+               $Entry.Settings.ProhibitSendReceive.Replace("MB","") -eq $Member.ProhibitSendReceiveQuota.value.ToMB())
             {
-                # Set mailbox quotas for the current member
-                Write-LogFile -Message "Trying to set custom Quota for $($member.SamAccountName)"
-                Set-Mailbox -Identity $member.SamAccountName -IssueWarningQuota $entry.Settings.IssueWarning -ProhibitSendQuota $entry.Settings.ProhibitSend -ProhibitSendReceiveQuota $entry.Settings.ProhibitSendReceive -UseDatabaseQuotaDefaults $false -DomainController $Domaincontroller -ErrorAction Stop
-                Write-LogFile -Message "Successfully set Custom Quota for $($member.SamAccountName) to $($entry.Settings.IssueWarning), $($entry.Settings.ProhibitSend), $($entry.Settings.ProhibitSendReceive)."
+                #Write-LogFile -Message "Skipping $($member.SamAccountName) as the quota is already set to values specified in config file."
+                Continue
             }
-
-            catch
+            
+            Else
             {
-                Write-LogFile -Message "Error setting Custom Quota for $($member.SamAccountName):" -ErrorInfo $_
+                try
+                {
+                    # Set mailbox quotas for the current member
+                    Write-LogFile -Message "Trying to set custom Quota for $($member.SamAccountName)"
+                    Set-Mailbox -Identity $member.SamAccountName -IssueWarningQuota $entry.Settings.IssueWarning -ProhibitSendQuota $entry.Settings.ProhibitSend -ProhibitSendReceiveQuota $entry.Settings.ProhibitSendReceive -UseDatabaseQuotaDefaults $false -DomainController $Domaincontroller -ErrorAction Stop
+                    Write-LogFile -Message "Successfully set Custom Quota for $($member.SamAccountName) to $($entry.Settings.IssueWarning), $($entry.Settings.ProhibitSend), $($entry.Settings.ProhibitSendReceive)."
+                }
+
+                catch
+                {
+                    Write-LogFile -Message "Error setting Custom Quota for $($member.SamAccountName):" -ErrorInfo $_
+                }
             }
         }
     }
