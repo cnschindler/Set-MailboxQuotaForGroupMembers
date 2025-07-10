@@ -1,15 +1,6 @@
 ########################################################################
 #
 # Set-MailboxQuotasForGroupMembers.ps1
-#
-# Sets Mailbox-Storage-Quotas of members of a group to predefined Values
-#
-# This script sets mailbox quotas for members of specified Active Directory groups based on a JSON configuration file.
-# The JSON configuration file defines the groups and their corresponding mailbox quota settings such as IssueWarningQuota,
-# ProhibitSendQuota, and ProhibitSendReceiveQuota.
-#
-# The script retrieves group members, checks if they have mailboxes, and applies the specified quota settings to each mailbox.
-# It also includes logging functionality to track the progress and any errors encountered during execution.
 # 
 # Requirements: Active Directory PowerShell Module and Exchange Management Shell
 #
@@ -22,6 +13,27 @@
 #
 ########################################################################
 
+<#
+.SYNOPSIS
+    Sets Mailbox-Storage-Quotas for members of a group to predefined Values
+.DESCRIPTION
+    This script sets mailbox quotas for members of specified Active Directory groups based on a JSON configuration file.
+    The JSON configuration file defines the groups and their corresponding mailbox quota settings such as IssueWarningQuota,
+    ProhibitSendQuota, and ProhibitSendReceiveQuota.
+
+    The script retrieves group members, checks if they have mailboxes, and applies the specified quota settings to each mailbox.
+    It also includes logging functionality to track the progress and any errors encountered during execution.
+.EXAMPLE
+    Set-MailboxQuotaForGroupMembers.ps1 -ConfigFile "C:\Path\To\Config.json"
+
+    This example runs the script with a specified configuration file that contains the group names and their quota settings.
+.NOTES
+    Version: 1.0
+.PARAMETER ConfigFile
+    Specifies the path to the JSON configuration file that contains the group names and their corresponding mailbox quota settings.
+    If not specified, it defaults to "Set-MailboxQuotaForGroupMembers-Config.json" in the script's directory.
+#>
+
 # Check if the script is running in PowerShell version 3.0 or higher and if the ActiveDirectory module is available
 # Requires statement ensures that the script will not run if the required version or module is not present
 #Requires -Version 3.0
@@ -31,12 +43,13 @@
 param (
     [Parameter(Mandatory=$false)]
     [System.IO.FileInfo]
-    $ConfigFile = (Join-Path -Path $PSScriptRoot -ChildPath "Set-MailboxQuotaForGroupMembers_Config.json")
+    $ConfigFile = (Join-Path -Path $PSScriptRoot -ChildPath "Set-MailboxQuotaForGroupMembers-Config.json")
 )
 
 # Global variables
 # Define the path for the logfile, using the script name and current date/time for uniqueness
-[System.IO.FileInfo]$LogfileFullPath = Join-Path -Path $PSScriptRoot (Join-Path $MyInvocation.MyCommand.Name ($MyInvocation.MyCommand.Name + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now))
+$Scriptname = $MyInvocation.MyCommand.Name.Replace(".ps1", "")
+[System.IO.FileInfo]$LogfileFullPath = Join-Path -Path $PSScriptRoot -ChildPath ($Scriptname  + "_{0:yyyyMMdd-HHmmss}.log" -f [DateTime]::Now)
 $script:NoLogging
 
 # Logging function, used for progress and error logging...
@@ -81,47 +94,22 @@ function Write-LogFile
         Write-Host $logLine
     }
 }
-function Import-ConfigFile
-{
-    # Check if the configuration file exists
-    if (-not (Test-Path -Path $ConfigFile -PathType Leaf))
-    {
-        Write-LogFile -Message "Configuration file not found: $ConfigFile"
-        Exit
-    }
 
-    # Load the configuration file
-    Write-LogFile -Message "Loading configuration file: $ConfigFile"
-    $Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
-
-    [string]$Script:Domaincontroller = $Config.Domaincontroller
-    $Script:Quotas = $Config.Quotas
-    $Script:LogFileAge = $Config.LogFileAge
-}
 Function Import-ADModule
 {
     $ModuleName = "ActiveDirectory"
-    $IsModuleInstalled = (Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1)
-    
-    if ($IsModuleInstalled.Name -eq "$($ModuleName)")
-    {   
-        try
-        {
-            Import-Module -Name $ModuleName -ErrorAction Stop -WarningAction SilentlyContinue -DisableNameChecking
-            Write-LogFile -Message "ActiveDirectory Module successfully loaded."
-        }
-        
-        catch
-        {
-            $Textbox_Messages.Text = "ActiveDirectory Module could not be loaded. Error: $($Error.Exception.InnerException)"
-            Write-LogFile -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_}
-    }
-
-    else
+    try
     {
-        Write-LogFile -Message "ActiveDirectory Module not installed. Please install first!"
+        Import-Module -Name $ModuleName -ErrorAction Stop -WarningAction SilentlyContinue -DisableNameChecking
+        Write-LogFile -Message "ActiveDirectory Module successfully loaded."
     }
-} 
+    
+    catch
+    {
+        $Textbox_Messages.Text = "ActiveDirectory Module could not be loaded. Error: $($Error.Exception.InnerException)"
+        Write-LogFile -Message "ActiveDirectory Module could not be loaded." -ErrorInfo $_
+    }
+}
 function Connect-ExchangeOnPremieses
 {
     # Check if a connection to an exchange server exists and connect if necessary...
@@ -178,10 +166,19 @@ Import-ADModule
 Connect-ExchangeOnPremieses
 
 # Import the configuration file
-Import-ConfigFile
+# Check if the configuration file exists
+if (-not (Test-Path -Path $ConfigFile -PathType Leaf))
+{
+    Write-LogFile -Message "Configuration file not found: $ConfigFile"
+    Exit
+}
 
-# Start setting mailbox quotas for group members
-Write-LogFile -Message "Starting to set mailbox quotas for group members."
+# Load the configuration file
+Write-LogFile -Message "Loading configuration file: $ConfigFile"
+$Config = Get-Content -Path $ConfigFile | ConvertFrom-Json
+[string]$Domaincontroller = $Config.Domaincontroller
+$Quotas = $Config.Quotas
+$LogFileAge = $Config.LogFileAge
 
 # Check if a Domaincontroller was specified in the configuration file, otherwise use the PrimaryDC
 if ([System.String]::IsNullOrEmpty($Domaincontroller))
@@ -194,6 +191,23 @@ else
 {
     Write-LogFile -Message "Using Domaincontroller specified in config file: $Domaincontroller"
 }
+
+# Check if the Domaincontroller is reachable
+Write-LogFile -Message "Checking if Domaincontroller $Domaincontroller is reachable..."
+# Using Test-Connection to verify network connectivity to the Domaincontroller
+if (-not (Test-Connection -ComputerName $Domaincontroller -Count 1 -ErrorAction SilentlyContinue))
+{
+    Write-LogFile -Message "Domaincontroller $Domaincontroller is not reachable. Please check the network connection or the Domaincontroller name."
+    Exit
+}
+
+else
+{
+    Write-LogFile -Message "Domaincontroller $Domaincontroller is reachable."
+}
+
+# Start setting mailbox quotas for group members
+Write-LogFile -Message "Starting to set mailbox quotas for group members."
 
 # Iterate through each quota entry defined in the configuration file
 foreach($entry in $Quotas)
@@ -245,19 +259,22 @@ Write-LogFile -Message "Finished setting mailbox quotas for group members."
 $logfiles = Get-ChildItem -Path $LogfileFullPath.Directory -Filter "*.log" | Where-Object {$_.creationtime -lt ((Get-Date).adddays(-$LogFileAge))}
 
 # Remove old logfiles
-foreach($file in $logfiles)
+if ($logfiles.Count -gt 0)
 {
-    try
+    foreach($file in $logfiles)
     {
-        # Remove the logfile
-        Remove-Item $file.FullName -force -ErrorAction Stop -Confirm:$false -WhatIf:$false
-        Write-LogFile -Message "Successfully removed logfile: $($file.FullName)"
-    }
+        try
+        {
+            # Remove the logfile
+            Remove-Item $file.FullName -force -ErrorAction Stop -Confirm:$false -WhatIf:$false
+            Write-LogFile -Message "Successfully removed logfile: $($file.FullName)"
+        }
 
-    catch
-    {
-        # If an error occurs while removing the logfile, log the error
-        Write-LogFile -Message "Error removing logfile: $($file.FullName)" -ErrorInfo $_
+        catch
+        {
+            # If an error occurs while removing the logfile, log the error
+            Write-LogFile -Message "Error removing logfile: $($file.FullName)" -ErrorInfo $_
+        }
     }
 }
 
